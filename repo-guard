@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""repo-guard: scan a git repository for code that runs itself when you open it.
+
+Built after the Ziggy Bites incident (Sep 2026), where a repo shipped a hidden
+VS Code/Cursor task that ran a JavaScript loader disguised as a font file
+(public/fonts/fa-solid-500.woff2) the moment the folder was opened.
+
+Usage:
+  repo-guard clone <git-url> [dir]   clone WITHOUT writing files, scan, then check out if clean
+  repo-guard scan  [path]            scan a repo that is already on disk
+  repo-guard harden                  turn off auto-run tasks in VS Code / Cursor
+
+Needs only Python 3.8+ and git. Exit code: 0 clean, 1 high/critical findings, 2 error.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+VERSION = "1.0.0"
+
+SEVERITIES = ["INFO", "MEDIUM", "HIGH", "CRITICAL"]
+MAX_TEXT_BYTES = 3 * 1024 * 1024  # content rules only look at the first 3 MB of a file
+SKIP_DIRS_ON_DISK = {".git", "node_modules", ".dart_tool", "build", "Pods", ".gradle", ".idea/caches"}
+
+# ---------------------------------------------------------------- known IOCs --
+# Indicators from the Ziggy Bites payload. Any match is treated as critical.
+# Stored split so this file does not flag itself.
+KNOWN_IOCS = {
+    "91.218." + "183.174": "C2 server used by the Ziggy Bites loader",
+    "0xa322E5f3D311D308" + "0e6f0121063e9aDC2490Ef1a": "Ethereum address the loader reads its C2 from",
+    "A8-" + "new*#": "campaign marker string in the Ziggy Bites loader",
+}
+
+# -------------------------------------------------------- binary file types --
+# Extension -> list of acceptable leading bytes. A file with one of these
+# extensions that is actually readable text is almost always a disguised script.
+MAGIC = {
+    ".woff": [b"wOFF"],
+    ".woff2": [b"wOF2"],
+    ".ttf": [b"\x00\x01\x00\x00", b"true", b"OTTO"],
+    ".otf": [b"OTTO", b"\x00\x01\x00\x00"],
+    ".png": [b"\x89PNG"],
+    ".jpg": [b"\xff\xd8\xff"],
+    ".jpeg": [b"\xff\xd8\xff"],
+    ".gif": [b"GIF8"],
+    ".ico": [b"\x00\x00\x01\x00", b"\x00\x00\x02\x00", b"\x89PNG"],
+    ".webp": [b"RIFF"],
+    ".bmp": [b"BM"],
+    ".pdf": [b"%PDF"],
+    ".zip": [b"PK"],
+    ".jar": [b"PK"],
+    ".apk": [b"PK"],
+    ".gz": [b"\x1f\x8b"],
+    ".mp3": [b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"],
+    ".mp4": [],  # checked separately ("ftyp" at offset 4)
+    ".wasm": [b"\x00asm"],
+}
+# ttf/eot/mp4 have looser formats; we only flag them when the content is text.
+TEXT_ONLY_CHECK = {".eot", ".mp4", ".mov", ".dat", ".bin"}
+
+CODE_EXTS = {".js", ".cjs", ".mjs", ".jsx", ".ts", ".tsx", ".py", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd"}
+SCRIPT_RUNNERS = r"(?:node|nodejs|deno|bun|python3?|bash|sh|zsh|pwsh|powershell)"
+
+# ------------------------------------------------------ suspicious JS signals --
+# (regex, weight, description). Weight 3 = strong on its own, 1 = weak signal.
+CODE_SIGNALS = [
+    (re.compile(r"global\s*\[\s*['\"]\w+['\"]\s*\]\s*=\s*require\b"), 3, "hides `require` behind a global alias"),
+    (re.compile(r"\bchild_process\b"), 1, "spawns shell commands (child_process)"),
+    (re.compile(r"\beval\s*\(|\bnew\s+Function\s*\("), 1, "runs strings as code (eval / new Function)"),
+    (re.compile(r"https?://(?!127\.|0\.0\.0\.0|10\.|192\.168\.|localhost)\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?"), 2,
+     "talks to a hard-coded IP address"),
+    (re.compile(r"api\.trongrid\.io|tronscan\.org|etherscan\.io|bsc-dataseed|eth_getTransaction|"
+                r"fullnode\.mainnet\.aptoslabs|api\.telegram\.org/bot", re.I), 2,
+     "looks up data on a blockchain / Telegram (common way to hide a C2 address)"),
+    (re.compile(r"\bpbpaste\b|clipboardy|\bxclip\b|Get-Clipboard", re.I), 2, "reads the clipboard"),
+    (re.compile(r"Login Data|Local Extension Settings|Library/Keychains|nkbihfbeogaeaoehlefnkodbefgpgknn|"
+                r"\.config/solana|Exodus/exodus\.wallet|\.ssh/id_", re.I), 3,
+     "references browser password stores, crypto wallets or SSH keys"),
+    (re.compile(r"(?:atob|Buffer\.from)\s*\(\s*['\"][A-Za-z0-9+/=]{300,}"), 2, "decodes a large base64 blob"),
+    (re.compile(r"(?:curl|wget)\s[^\n|;]{0,200}\|\s*(?:ba|z)?sh\b"), 2, "downloads and pipes straight into a shell"),
+]
+PADDING = re.compile(rb"[ \t]{150,}(?=\S)")  # code pushed off-screen with whitespace
+
+
+class Finding:
+    def __init__(self, severity, path, title, detail=""):
+        self.severity, self.path, self.title, self.detail = severity, path, title, detail
+
+    def as_dict(self):
+        return {"severity": self.severity, "path": self.path, "title": self.title, "detail": self.detail}
+
+
+# ------------------------------------------------------------ file sources --
+def iter_disk(root):
+    """Yield (relpath, size, reader) for files in a folder on disk."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS_ON_DISK]
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            rel = os.path.relpath(full, root)
+
+            def reader(limit, full=full):
+                try:
+                    with open(full, "rb") as fh:
+                        return fh.read(limit)
+                except OSError:
+                    return b""
+
+            yield rel, os.path.getsize(full), reader
+
+
+def iter_git_tree(gitdir, rev="HEAD"):
+    """Yield (relpath, size, reader) straight from git objects -- nothing is written to disk."""
+    out = subprocess.run(["git", "--git-dir", gitdir, "ls-tree", "-r", "-l", "-z", rev],
+                         capture_output=True, check=True).stdout
+    for entry in out.split(b"\0"):
+        if not entry:
+            continue
+        meta, path = entry.split(b"\t", 1)
+        mode, kind, sha, size = meta.split()
+        if kind != b"blob" or mode == b"120000":  # skip submodules and symlinks
+            continue
+
+        def reader(limit, sha=sha.decode()):
+            proc = subprocess.Popen(["git", "--git-dir", gitdir, "cat-file", "blob", sha],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            data = proc.stdout.read(limit)
+            proc.stdout.close()
+            proc.kill()
+            proc.wait()
+            return data
+
+        yield path.decode("utf-8", "replace"), int(size), reader
+
+
+# ------------------------------------------------------------------- rules --
+def is_mostly_text(data):
+    if not data:
+        return False
+    sample = data[:8192]
+    if b"\x00" in sample:
+        return False
+    printable = sum(1 for b in sample if b in (9, 10, 13) or 32 <= b < 127 or b >= 128)
+    return printable / len(sample) > 0.95
+
+
+def code_score(text):
+    hits, score = [], 0
+    for rx, weight, desc in CODE_SIGNALS:
+        if rx.search(text):
+            hits.append(desc)
+            score += weight
+    return score, hits
+
+
+def check_iocs(path, text, findings):
+    for ioc, why in KNOWN_IOCS.items():
+        if ioc in text:
+            findings.append(Finding("CRITICAL", path, "Known malware indicator: " + ioc, why))
+
+
+def check_disguised(path, data, findings):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in MAGIC and ext not in TEXT_ONLY_CHECK:
+        return
+    if not data or data.startswith(b"version https://git-lfs"):
+        return
+    if ext == ".mp4" and data[4:8] == b"ftyp":
+        return
+    magics = MAGIC.get(ext, [])
+    if magics and any(data.startswith(m) for m in magics):
+        return
+    if not is_mostly_text(data):
+        return  # wrong/unknown binary header, but not a script
+    text = data.decode("utf-8", "replace")
+    score, hits = code_score(text)
+    looks_like_js = re.search(r"\brequire\s*\(|=>|\bfunction\b|\bmodule\.exports\b|\bglobal\s*\[", text)
+    if score or looks_like_js:
+        findings.append(Finding("CRITICAL", path, "Script disguised as a %s file" % ext,
+                                "This is readable code, not a real %s. %s" % (ext, "; ".join(hits))))
+    else:
+        findings.append(Finding("HIGH", path, "Text file disguised as a %s file" % ext,
+                                "A real %s file is binary; this one is plain text." % ext))
+
+
+def extract_commands(text):
+    cmds = re.findall(r'"(?:command|args|postCreateCommand|postStartCommand|postAttachCommand|'
+                      r'initializeCommand|onCreateCommand|updateContentCommand)"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+    return [c.encode().decode("unicode_escape", "replace") for c in cmds]
+
+
+def runs_non_code_file(cmd):
+    for m in re.finditer(SCRIPT_RUNNERS + r"\s+(?:-\S+\s+)*[\"']?([^\s\"'|;&)]+)", cmd):
+        target = m.group(1)
+        ext = os.path.splitext(target)[1].lower()
+        if ext and ext not in CODE_EXTS and not target.startswith("-"):
+            return target
+    return None
+
+
+def check_editor_config(path, text, findings):
+    """Auto-run tasks in VS Code / Cursor / devcontainer config."""
+    low = path.lower().replace("\\", "/")
+    is_editor = (low.startswith((".vscode/", ".cursor/", ".devcontainer/", ".theia/"))
+                 or "/.vscode/" in low or "/.cursor/" in low or low.endswith(".code-workspace")
+                 or low.endswith("devcontainer.json"))
+    if not is_editor:
+        return
+    cmds = extract_commands(text)
+    shown = "; ".join(c.strip()[:160] for c in cmds[:3])
+
+    if re.search(r'"runOn"\s*:\s*"folderOpen"', text):
+        hidden = re.search(r'"reveal"\s*:\s*"never"|"hide"\s*:\s*true|"echo"\s*:\s*false', text)
+        findings.append(Finding(
+            "CRITICAL", path,
+            "Task runs automatically when the folder is opened" + (" and hides its output" if hidden else ""),
+            "Command(s): " + (shown or "(not found)")))
+    for cmd in cmds:
+        target = runs_non_code_file(cmd)
+        if target:
+            findings.append(Finding("CRITICAL", path, "Editor config executes a non-code file: " + target,
+                                    "Command: " + cmd.strip()[:200]))
+    if "devcontainer" in low:
+        if re.search(r'"initializeCommand"', text):
+            findings.append(Finding("HIGH", path, "devcontainer runs a command on YOUR machine before building",
+                                    "initializeCommand runs on the host, not inside the container. " + shown))
+        elif cmds:
+            findings.append(Finding("MEDIUM", path, "devcontainer runs commands on create/start", shown))
+
+
+def check_package_json(path, text, findings):
+    if os.path.basename(path) != "package.json":
+        return
+    try:
+        scripts = json.loads(text).get("scripts") or {}
+    except (ValueError, AttributeError):
+        return
+    for name in ("preinstall", "install", "postinstall", "prepare", "prepublish"):
+        cmd = scripts.get(name)
+        if not isinstance(cmd, str):
+            continue
+        target = runs_non_code_file(cmd)
+        danger = target or re.search(r"curl|wget|base64|\bnode\s+-e\b|\beval\b", cmd)
+        sev = "HIGH" if danger else "MEDIUM"
+        findings.append(Finding(sev, path, "`npm install` will run the %s script" % name, cmd[:200]))
+
+
+def check_code(path, data, text, findings):
+    m = PADDING.search(data)
+    if m:
+        tail = data[m.end():m.end() + 400].decode("utf-8", "replace")
+        tail_score, _ = code_score(tail)
+        # Only flag when what is hidden is actually code, not a wide table or ASCII art.
+        if tail_score or re.search(r"\brequire\s*\(|\beval\b|\bglobal\s*[\[.]|=>|\bfunction\s*\(|"
+                                   r"\bprocess\.|\bexec\s*\(|\bimport\s*\(", tail):
+            findings.append(Finding("HIGH", path, "Code hidden off-screen behind a long run of whitespace",
+                                    "Hidden text starts with: " + tail[:120].strip()))
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in CODE_EXTS and ext not in (".json", ".gradle", ".kts", ".rb", ".podspec", ".yaml", ".yml", ""):
+        return
+    score, hits = code_score(text)
+    if score >= 5:
+        findings.append(Finding("CRITICAL", path, "Strong malware-like behaviour in code", "; ".join(hits)))
+    elif score >= 3:
+        findings.append(Finding("HIGH", path, "Suspicious code", "; ".join(hits)))
+
+
+def _self_digest():
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            data = fh.read()
+        return len(data), hashlib.sha256(data).digest()
+    except OSError:
+        return None, None
+
+
+def scan(files):
+    findings = []
+    count = 0
+    own_size, own_hash = _self_digest()  # an exact copy of this scanner contains its own patterns
+    for path, size, reader in files:
+        count += 1
+        data = reader(min(size, MAX_TEXT_BYTES) or 1)
+        if size == own_size and hashlib.sha256(data).digest() == own_hash:
+            continue
+        check_disguised(path, data[:8192], findings)
+        if not is_mostly_text(data):
+            continue
+        text = data.decode("utf-8", "replace")
+        check_iocs(path, text, findings)
+        check_editor_config(path, text, findings)
+        check_package_json(path, text, findings)
+        check_code(path, data, text, findings)
+    findings.sort(key=lambda f: (-SEVERITIES.index(f.severity), f.path))
+    return count, findings
+
+
+# ------------------------------------------------------------------ output --
+def color(sev, s):
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return s
+    code = {"CRITICAL": "1;41;97", "HIGH": "1;31", "MEDIUM": "33", "INFO": "36"}[sev]
+    return "\033[%sm%s\033[0m" % (code, s)
+
+
+def report(target, count, findings, as_json):
+    if as_json:
+        print(json.dumps({"target": target, "files_scanned": count,
+                          "findings": [f.as_dict() for f in findings]}, indent=2))
+        return
+    print("repo-guard %s  scanned %d files in %s\n" % (VERSION, count, target))
+    if not findings:
+        print(color("INFO", "No auto-run tasks, disguised scripts or known malware found."))
+        return
+    for f in findings:
+        print("%s  %s" % (color(f.severity, "[%s]" % f.severity), f.path))
+        print("    " + f.title)
+        if f.detail:
+            print("    " + f.detail)
+        print()
+
+
+def is_dangerous(findings):
+    return any(f.severity in ("HIGH", "CRITICAL") for f in findings)
+
+
+# ---------------------------------------------------------------- commands --
+def cmd_scan(args):
+    root = os.path.abspath(args.path)
+    if not os.path.isdir(root):
+        sys.exit("repo-guard: not a folder: " + root)
+    count, findings = scan(iter_disk(root))
+    report(root, count, findings, args.json)
+    if is_dangerous(findings) and not args.json:
+        print(color("HIGH", "Do NOT open this folder in VS Code / Cursor until the items above are removed."))
+    return 1 if is_dangerous(findings) else 0
+
+
+def cmd_clone(args):
+    dest = args.dir or re.sub(r"\.git$", "", args.url.rstrip("/").split("/")[-1].split(":")[-1])
+    if os.path.exists(dest):
+        sys.exit("repo-guard: %s already exists" % dest)
+    work = tempfile.mkdtemp(prefix="repo-guard-")
+    gitdir = os.path.join(work, "repo.git")
+    try:
+        # A bare clone only stores git objects; no repo file ever lands on disk as a file.
+        clone = ["git", "-c", "core.hooksPath=/dev/null", "clone", "--bare", "--quiet"]
+        if args.branch:
+            clone += ["--branch", args.branch]
+        subprocess.run(clone + [args.url, gitdir], check=True)
+        count, findings = scan(iter_git_tree(gitdir))
+        report(args.url, count, findings, args.json)
+        if is_dangerous(findings) and not args.force:
+            print(color("HIGH", "Blocked: the repo was NOT checked out. Nothing from it is on your disk."))
+            print("If you are sure it is safe, re-run with --force.")
+            return 1
+        subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "clone", "--quiet"]
+                       + (["--branch", args.branch] if args.branch else []) + [gitdir, dest], check=True)
+        subprocess.run(["git", "-C", dest, "remote", "set-url", "origin", args.url], check=True)
+        print("Checked out to %s" % os.path.abspath(dest))
+        return 1 if is_dangerous(findings) else 0
+    except subprocess.CalledProcessError as e:
+        sys.exit("repo-guard: git failed: %s" % e)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cmd_harden(args):
+    """Set task.allowAutomaticTasks=off in VS Code / Cursor user settings."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    elif os.name == "nt":
+        base = os.environ.get("APPDATA", "")
+    else:
+        base = os.path.join(home, ".config")
+    wanted = {"task.allowAutomaticTasks": "off", "security.workspace.trust.enabled": True}
+    for app in ("Code", "Cursor", "Code - Insiders", "Windsurf", "VSCodium"):
+        path = os.path.join(base, app, "User", "settings.json")
+        if not os.path.isdir(os.path.dirname(path)):
+            continue
+        raw = open(path).read() if os.path.exists(path) else "{}"
+        try:
+            settings = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            print("%-16s settings.json has comments; add these lines by hand:\n%s"
+                  % (app, "\n".join('    "%s": %s,' % (k, json.dumps(v)) for k, v in wanted.items())))
+            continue
+        if all(settings.get(k) == v for k, v in wanted.items()):
+            print("%-16s already hardened" % app)
+            continue
+        if os.path.exists(path):
+            shutil.copy2(path, path + ".repo-guard.bak")
+        settings.update(wanted)
+        with open(path, "w") as fh:
+            json.dump(settings, fh, indent=4)
+        print("%-16s hardened (%s)" % (app, path))
+    print("\nFolder-open tasks will no longer run by themselves. Restart the editor to apply.")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="repo-guard", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("scan", help="scan a repo already on disk")
+    s.add_argument("path", nargs="?", default=".")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_scan)
+
+    c = sub.add_parser("clone", help="clone safely: scan before any file is written")
+    c.add_argument("url")
+    c.add_argument("dir", nargs="?")
+    c.add_argument("-b", "--branch")
+    c.add_argument("--force", action="store_true", help="check out even if dangerous findings exist")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=cmd_clone)
+
+    h = sub.add_parser("harden", help="stop VS Code / Cursor running tasks on folder open")
+    h.set_defaults(fn=cmd_harden)
+
+    args = p.parse_args()
+    sys.exit(args.fn(args))
+
+
+if __name__ == "__main__":
+    main()
